@@ -11,5 +11,8 @@ allprojects {
     repositories {
         google()
         mavenCentral()
+        // 追加 Xposed 专属 API 仓库与 jcenter 归档作为后备
+        maven { url 'https://api.xposed.info/' }
+        jcenter()
     }
 }
