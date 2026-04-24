@@ -14,10 +14,6 @@ import java.util.List;
 
 public class MainHook implements IXposedHookLoadPackage {
 
-    private static final String TARGET_ANDROID = "android";
-    private static final String TARGET_SYSTEM_UI = "com.android.systemui";
-    
-    // 已确认的目标输入法包名
     private static final List<String> TARGET_IME_PACKAGES = Arrays.asList(
             "com.tencent.wetype", 
             "com.bytedance.android.doubaoime"
@@ -25,128 +21,71 @@ public class MainHook implements IXposedHookLoadPackage {
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
-        if (TARGET_ANDROID.equals(lpparam.packageName) || TARGET_SYSTEM_UI.equals(lpparam.packageName)) {
-            injectMiuiImeWhitelistDynamic(lpparam);
-        }
-    }
-
-    private void injectMiuiImeWhitelistDynamic(XC_LoadPackage.LoadPackageParam lpparam) {
-        XposedBridge.log("[IME_Bridge] [" + lpparam.packageName + "] 正在启动 HyperOS 绝杀版白名单扫描...");
-
-        String[] targetClasses = {
+        if ("android".equals(lpparam.packageName) || "com.android.systemui".equals(lpparam.packageName)) {
+            XposedBridge.log("[IME_Bridge] [" + lpparam.packageName + "] 启动 v0.11.0 全量特征劫持...");
+            
+            String[] targetClasses = {
                 "miui.view.inputmethod.InputMethodHelper",
                 "android.inputmethodservice.InputMethodServiceInjector",
                 "com.miui.inputmethod.InputMethodBottomManager",
                 "com.miui.inputmethod.InputMethodBottomManagerHelper",
-                "com.android.systemui.inputmethod.InputMethodBottomManager",
-                "com.miui.systemui.inputmethod.InputMethodBottomManager"
-        };
+                "com.android.internal.inputmethod.InputMethodPrivilegedOperations",
+                "com.android.server.inputmethod.InputMethodManagerService"
+            };
 
-        boolean foundAnyClass = false;
+            for (String className : targetClasses) {
+                Class<?> clazz = XposedHelpers.findClassIfExists(className, lpparam.classLoader);
+                if (clazz == null) continue;
 
-        for (String className : targetClasses) {
-            Class<?> clazz = XposedHelpers.findClassIfExists(className, lpparam.classLoader);
-            if (clazz == null) continue;
+                XposedBridge.log("[IME_Bridge] 扫描目标类: " + className);
 
-            foundAnyClass = true;
-            XposedBridge.log("[IME_Bridge] [" + lpparam.packageName + "] 成功命中底层类: " + className);
-
-            for (Method method : clazz.getDeclaredMethods()) {
-                if (Modifier.isAbstract(method.getModifiers()) || Modifier.isNative(method.getModifiers())) {
-                    continue;
-                }
-
-                // 绝杀策略 1：拦截返回列表/数组的方法
-                if (List.class.isAssignableFrom(method.getReturnType()) || String[].class.isAssignableFrom(method.getReturnType())) {
-                    try {
-                        XposedBridge.hookMethod(method, new XC_MethodHook() {
-                            @Override
-                            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                                Object result = param.getResult();
-                                if (result == null) return;
-
-                                if (result instanceof List) {
-                                    List<String> supportList = new ArrayList<>((List<String>) result);
-                                    boolean modified = false;
-                                    for (String pkg : TARGET_IME_PACKAGES) {
-                                        if (!supportList.contains(pkg)) {
-                                            supportList.add(pkg);
-                                            modified = true;
+                for (Method method : clazz.getDeclaredMethods()) {
+                    // 策略 A: 强制放行所有返回布尔值且参数中包含 String 的方法 (核心鉴权点)
+                    if (method.getReturnType() == boolean.class) {
+                        Class<?>[] params = method.getParameterTypes();
+                        for (int i = 0; i < params.length; i++) {
+                            if (params[i] == String.class) {
+                                final int index = i;
+                                try {
+                                    XposedBridge.hookMethod(method, new XC_MethodHook() {
+                                        @Override
+                                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                                            String inputPkg = (String) param.args[index];
+                                            if (TARGET_IME_PACKAGES.contains(inputPkg)) {
+                                                param.setResult(true);
+                                                XposedBridge.log("[IME_Bridge] 全量拦截生效: " + method.getName() + " -> " + inputPkg);
+                                            }
                                         }
-                                    }
-                                    if (modified) {
-                                        param.setResult(supportList);
-                                        XposedBridge.log("[IME_Bridge] 动态列表注入成功: " + method.getName());
-                                    }
-                                } else if (result instanceof String[]) {
-                                    List<String> supportList = new ArrayList<>(Arrays.asList((String[]) result));
-                                    boolean modified = false;
-                                    for (String pkg : TARGET_IME_PACKAGES) {
-                                        if (!supportList.contains(pkg)) {
-                                            supportList.add(pkg);
-                                            modified = true;
-                                        }
-                                    }
-                                    if (modified) {
-                                        param.setResult(supportList.toArray(new String[0]));
-                                        XposedBridge.log("[IME_Bridge] 动态数组注入成功: " + method.getName());
-                                    }
-                                }
+                                    });
+                                } catch (Throwable t) {}
+                                break;
                             }
-                        });
-                        XposedBridge.log("[IME_Bridge] 已挂载列表鉴权方法: " + method.getName());
-                    } catch (Throwable t) {}
-                }
+                        }
+                    }
 
-                // 绝杀策略 2：无视参数类型，强行拦截布尔鉴权方法
-                if (method.getReturnType() == boolean.class) {
-                    String mName = method.getName().toLowerCase();
-                    // 锁定可能与输入法白名单或全面屏优化相关的特征名
-                    if (mName.contains("support") || mName.contains("white") || mName.contains("full") || mName.contains("opt")) {
+                    // 策略 B: 强制向返回的列表/数组中注入目标包名
+                    if (List.class.isAssignableFrom(method.getReturnType()) || String[].class.isAssignableFrom(method.getReturnType())) {
                         try {
                             XposedBridge.hookMethod(method, new XC_MethodHook() {
                                 @Override
                                 protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                                    boolean originalResult = false;
-                                    if (param.getResult() != null) {
-                                        originalResult = (boolean) param.getResult();
-                                    }
-                                    
-                                    if (originalResult) return; // 系统本来就放行的不干预
-
-                                    // 检查参数堆栈中是否包含我们的输入法包名（处理 InputMethodInfo 等复杂对象传参）
-                                    boolean shouldForceTrue = false;
-                                    if (param.args == null || param.args.length == 0) {
-                                        // 无参方法，直接盲狙放行
-                                        shouldForceTrue = true;
-                                    } else {
-                                        for (Object arg : param.args) {
-                                            if (arg == null) continue;
-                                            String argStr = arg.toString();
-                                            for (String pkg : TARGET_IME_PACKAGES) {
-                                                if (argStr.contains(pkg)) {
-                                                    shouldForceTrue = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if (shouldForceTrue) {
-                                        param.setResult(true);
-                                        XposedBridge.log("[IME_Bridge] 布尔鉴权强势放行 -> true [" + method.getName() + "]");
+                                    Object res = param.getResult();
+                                    if (res == null) return;
+                                    if (res instanceof List) {
+                                        List<String> list = new ArrayList<>((List<String>) res);
+                                        for (String p : TARGET_IME_PACKAGES) if (!list.contains(p)) list.add(p);
+                                        param.setResult(list);
+                                    } else if (res instanceof String[]) {
+                                        List<String> list = new ArrayList<>(Arrays.asList((String[]) res));
+                                        for (String p : TARGET_IME_PACKAGES) if (!list.contains(p)) list.add(p);
+                                        param.setResult(list.toArray(new String[0]));
                                     }
                                 }
                             });
-                            XposedBridge.log("[IME_Bridge] 已挂载布尔鉴权方法: " + method.getName());
                         } catch (Throwable t) {}
                     }
                 }
             }
-        }
-
-        if (!foundAnyClass) {
-            XposedBridge.log("[IME_Bridge] [" + lpparam.packageName + "] 严重警告: 未找到任何已知鉴权类，HyperOS 可能已将底栏逻辑迁移至其他包！");
         }
     }
 }
