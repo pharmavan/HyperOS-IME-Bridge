@@ -22,7 +22,6 @@ public class MainHook implements IXposedHookLoadPackage {
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
         
-        // 全面覆盖系统核心与 SystemUI 中的底栏控制类
         String[] targetClasses = {
                 "miui.view.inputmethod.InputMethodHelper",
                 "android.inputmethodservice.InputMethodServiceInjector",
@@ -30,6 +29,18 @@ public class MainHook implements IXposedHookLoadPackage {
                 "com.miui.inputmethod.InputMethodBottomManagerHelper",
                 "com.android.systemui.inputmethod.InputMethodBottomManager"
         };
+
+        // 进程效验：如果当前进程未包含任何目标鉴权类，直接退出节约性能
+        boolean isTargetProcess = false;
+        for (String cls : targetClasses) {
+            if (XposedHelpers.findClassIfExists(cls, lpparam.classLoader) != null) {
+                isTargetProcess = true;
+                break;
+            }
+        }
+        if (!isTargetProcess) return;
+
+        XposedBridge.log("[IME_Bridge] V1.2.0 终极伪装版注入进程: " + lpparam.packageName);
 
         for (String className : targetClasses) {
             Class<?> clazz = XposedHelpers.findClassIfExists(className, lpparam.classLoader);
@@ -40,14 +51,15 @@ public class MainHook implements IXposedHookLoadPackage {
                     continue;
                 }
 
-                // 策略 1: 精准定点狙击白名单列表（修复此前强转导致的 NPE 内存崩溃）
-                if (method.getName().equals("getSupportIme") && List.class.isAssignableFrom(method.getReturnType())) {
+                String mName = method.getName().toLowerCase();
+
+                // 策略 1: 列表注入（防 NPE 安全版）
+                if (mName.equals("getsupportime") && List.class.isAssignableFrom(method.getReturnType())) {
                     XposedBridge.hookMethod(method, new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                             Object res = param.getResult();
                             if (res instanceof List) {
-                                // 深度克隆系统原始列表，安全注入目标包名
                                 List<String> modified = new ArrayList<>((List<String>) res);
                                 boolean changed = false;
                                 for (String pkg : TARGET_IMES) {
@@ -56,52 +68,37 @@ public class MainHook implements IXposedHookLoadPackage {
                                         changed = true;
                                     }
                                 }
-                                if (changed) {
-                                    param.setResult(modified);
-                                    XposedBridge.log("[IME_Bridge] 成功注入列表: " + method.getName() + " in " + lpparam.packageName);
-                                }
+                                if (changed) param.setResult(modified);
                             }
                         }
                     });
+                    XposedBridge.log("[IME_Bridge] 挂载列表注入: " + method.getName() + " in " + className);
                 }
 
-                // 策略 2: 全量劫持包名特征验证（欺骗系统使其渲染 MIUI 专属剪贴板底栏）
+                // 策略 2: 无差别特征欺骗（修正参数拦截错误）
                 if (method.getReturnType() == boolean.class) {
-                    Class<?>[] params = method.getParameterTypes();
-                    // 拦截接收 String (包名) 的布尔方法
-                    if (params.length == 1 && params[0] == String.class) {
-                        String mName = method.getName().toLowerCase();
-                        // 涵盖 isImeSupport, isSogouIme, isBaiduIme, isMiuiCustomIme 等所有判定
-                        if (mName.startsWith("is") || mName.contains("support") || mName.contains("white") || mName.contains("ime")) {
-                            XposedBridge.hookMethod(method, new XC_MethodHook() {
-                                @Override
-                                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                                    String arg = (String) param.args[0];
-                                    if (arg != null) {
-                                        for (String target : TARGET_IMES) {
-                                            if (arg.contains(target)) {
-                                                param.setResult(true);
-                                                XposedBridge.log("[IME_Bridge] 包名深度伪装放行 [" + method.getName() + "] -> " + target + " in " + lpparam.packageName);
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                        }
+                    boolean isTargetBoolean = false;
+                    
+                    // 涵盖所有底栏白名单鉴权
+                    if (mName.contains("support") || mName.contains("white") || mName.contains("opt")) {
+                        isTargetBoolean = true;
+                    } 
+                    // 涵盖所有小米深度定制版输入法（带剪贴板）判定
+                    else if (mName.startsWith("is") && (mName.contains("sogou") || mName.contains("baidu") || mName.contains("miui") || mName.contains("custom"))) {
+                        isTargetBoolean = true;
                     }
-                    // 策略 3: 强制开启底栏全局状态开关
-                    else if (params.length == 0) {
-                        String mName = method.getName().toLowerCase();
-                        if (mName.contains("bottom") && (mName.contains("enable") || mName.contains("show"))) {
+
+                    if (isTargetBoolean) {
+                        try {
                             XposedBridge.hookMethod(method, new XC_MethodHook() {
                                 @Override
                                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                                    // 无论系统传什么参数过来，一律暴力回答 true
                                     param.setResult(true);
-                                    XposedBridge.log("[IME_Bridge] 底部全局开关放行 [" + method.getName() + "] in " + lpparam.packageName);
                                 }
                             });
-                        }
+                            XposedBridge.log("[IME_Bridge] 挂载布尔欺骗: " + method.getName() + " in " + className);
+                        } catch (Throwable t) {}
                     }
                 }
             }
